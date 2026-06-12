@@ -14,6 +14,9 @@
 	},
 	"scripts": {
 		"dev": "vite",
+		"dev:build:mac:x64": "npm run build:native:mac && tsc && vite build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir:x64 -c.mac.identity=null && npm run dev:sign-mac-local -- release/$npm_package_version/mac/Openscreen.app && open -n release/$npm_package_version/mac/Openscreen.app",
+		"dev:reset-mac-permissions": "scripts/reset-macos-permissions.sh",
+		"dev:sign-mac-local": "scripts/sign-macos-local.sh",
 		"build": "tsc && vite build && electron-builder",
 		"lint": "biome check .",
 		"lint:fix": "biome check --write .",
