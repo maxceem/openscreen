@@ -5,6 +5,23 @@ import Foundation
 
 struct CursorHelperRequest: Decodable {
 	let sampleIntervalMs: Int?
+	let windowId: UInt32?
+}
+
+struct Rectangle {
+	let x: Double
+	let y: Double
+	let width: Double
+	let height: Double
+}
+
+func rectanglePayload(_ rectangle: Rectangle) -> [String: Double] {
+	[
+		"x": rectangle.x,
+		"y": rectangle.y,
+		"width": rectangle.width,
+		"height": rectangle.height,
+	]
 }
 
 struct CapturedCursorAsset {
@@ -286,6 +303,43 @@ func leftButtonDown() -> Bool {
 	CGEventSource.buttonState(.hidSystemState, button: .left)
 }
 
+final class WindowBoundsCache {
+	func bounds(for windowId: UInt32?) -> Rectangle? {
+		guard let windowId else { return nil }
+		return readWindowBounds(windowId)
+	}
+
+	private func readWindowBounds(_ windowId: UInt32) -> Rectangle? {
+		guard let windows = CGWindowListCopyWindowInfo(
+			.optionIncludingWindow,
+			CGWindowID(windowId)
+		) as? [[String: Any]] else {
+			return nil
+		}
+
+		guard let window = windows.first,
+			let boundsDictionary = window[kCGWindowBounds as String] as? NSDictionary
+		else {
+			return nil
+		}
+
+		var bounds = CGRect.null
+		guard CGRectMakeWithDictionaryRepresentation(boundsDictionary as CFDictionary, &bounds),
+			bounds.width > 0,
+			bounds.height > 0
+		else {
+			return nil
+		}
+
+		return Rectangle(
+			x: Double(bounds.origin.x),
+			y: Double(bounds.origin.y),
+			width: Double(bounds.width),
+			height: Double(bounds.height)
+		)
+	}
+}
+
 func requestAccessibilityTrust() -> Bool {
 	let options = [
 		kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
@@ -300,12 +354,14 @@ if CommandLine.arguments.count >= 2,
 {
 	request = decoded
 } else {
-	request = CursorHelperRequest(sampleIntervalMs: nil)
+	request = CursorHelperRequest(sampleIntervalMs: nil, windowId: nil)
 }
 
 let intervalMs = max(8, request.sampleIntervalMs ?? 33)
 let accessibilityTrusted = requestAccessibilityTrust()
 let mouseTracker = MouseButtonTracker()
+let trackWindowBounds = request.windowId != nil
+let windowBoundsCache = WindowBoundsCache()
 let mouseTapReady = mouseTracker.start()
 emit([
 	"type": "ready",
@@ -337,7 +393,7 @@ while true {
 				"scaleFactor": asset.scaleFactor,
 			]
 		}
-		emit([
+		var samplePayload: [String: Any?] = [
 			"type": "sample",
 			"timestampMs": timestampMs(),
 			"cursorType": currentCursorType(),
@@ -346,7 +402,11 @@ while true {
 			"leftButtonDown": leftButtonDown(),
 			"leftButtonPressed": mouseEvents.leftDownCount > 0,
 			"leftButtonReleased": mouseEvents.leftUpCount > 0,
-		])
+		]
+		if trackWindowBounds {
+			samplePayload["captureBounds"] = windowBoundsCache.bounds(for: request.windowId).map(rectanglePayload)
+		}
+		emit(samplePayload)
 		Thread.sleep(forTimeInterval: Double(intervalMs) / 1000.0)
 	}
 }

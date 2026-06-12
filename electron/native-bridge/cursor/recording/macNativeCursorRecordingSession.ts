@@ -3,6 +3,7 @@ import { accessSync, constants as fsConstants } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { type Rectangle, screen, systemPreferences } from "electron";
+import { normalizeNativeMacCaptureBounds } from "../../../../src/lib/nativeMacRecording";
 import type {
 	CursorRecordingData,
 	CursorRecordingSample,
@@ -24,8 +25,10 @@ interface MacCursorAssetPayload {
 interface MacNativeCursorRecordingSessionOptions {
 	getDisplayBounds: () => Rectangle | null;
 	maxSamples: number;
+	requireCaptureBounds?: boolean;
 	sampleIntervalMs: number;
 	startTimeMs?: number;
+	windowId?: number | null;
 }
 
 type MacCursorEvent =
@@ -41,6 +44,7 @@ type MacCursorEvent =
 			cursorType?: NativeCursorType | null;
 			assetId?: string | null;
 			asset?: MacCursorAssetPayload | null;
+			captureBounds?: Rectangle | null;
 			leftButtonDown?: boolean;
 			leftButtonPressed?: boolean;
 			leftButtonReleased?: boolean;
@@ -193,6 +197,16 @@ export class MacNativeCursorRecordingSession implements CursorRecordingSession {
 	private readyTimer: NodeJS.Timeout | null = null;
 	private previousLeftButtonDown = false;
 	private consecutiveOutsideSamples = 0;
+	private lastKnownCaptureBounds: Rectangle | null = null;
+	private pendingInteractionEvents: Array<{
+		timestampMs: number;
+		cursorX: number;
+		cursorY: number;
+		cursorType: NativeCursorType | null;
+		assetId: string | null;
+		interactionType: "click" | "mouseup";
+		bounds: Rectangle;
+	}> = [];
 	// Hide only after this many consecutive out-of-bounds samples (~100ms at 33ms interval).
 	// Fast swipes that briefly exit the display are clipped by clip-path instead of disappearing.
 	private static readonly OUTSIDE_HIDE_THRESHOLD = 3;
@@ -206,6 +220,8 @@ export class MacNativeCursorRecordingSession implements CursorRecordingSession {
 		this.startTimeMs = this.options.startTimeMs ?? Date.now();
 		this.previousLeftButtonDown = false;
 		this.consecutiveOutsideSamples = 0;
+		this.lastKnownCaptureBounds = null;
+		this.pendingInteractionEvents = [];
 
 		try {
 			systemPreferences.isTrustedAccessibilityClient(true);
@@ -225,6 +241,9 @@ export class MacNativeCursorRecordingSession implements CursorRecordingSession {
 			[
 				JSON.stringify({
 					sampleIntervalMs: this.options.sampleIntervalMs,
+					...(typeof this.options.windowId === "number" && Number.isFinite(this.options.windowId)
+						? { windowId: this.options.windowId }
+						: {}),
 				}),
 			],
 			{
@@ -286,10 +305,21 @@ export class MacNativeCursorRecordingSession implements CursorRecordingSession {
 	}
 
 	private startPositionOnlyFallback() {
-		this.captureSample(Date.now(), null, null, false, false, false);
-		this.fallbackInterval = setInterval(() => {
-			this.captureSample(Date.now(), null, null, false, false, false);
-		}, this.options.sampleIntervalMs);
+		// For window recordings we need real window bounds (display bounds would
+		// normalize the cursor against the wrong rectangle and reintroduce the
+		// proportional skew). Without the helper there's no way to get them, so
+		// emit no cursor samples — the renderer will draw without an overlay.
+		if (this.options.requireCaptureBounds) {
+			return;
+		}
+		const captureFallbackSample = () => {
+			const cursor = screen.getCursorScreenPoint();
+			const bounds =
+				this.options.getDisplayBounds() ?? screen.getDisplayNearestPoint(cursor).bounds;
+			this.captureSample(Date.now(), null, null, bounds, false, false, false);
+		};
+		captureFallbackSample();
+		this.fallbackInterval = setInterval(captureFallbackSample, this.options.sampleIntervalMs);
 	}
 
 	private rememberAsset(asset: MacCursorAssetPayload | null | undefined) {
@@ -347,6 +377,7 @@ export class MacNativeCursorRecordingSession implements CursorRecordingSession {
 				payload.timestampMs,
 				normalizeCursorType(payload.cursorType),
 				payload.assetId ?? null,
+				normalizeNativeMacCaptureBounds(payload.captureBounds),
 				payload.leftButtonDown === true,
 				payload.leftButtonPressed === true,
 				payload.leftButtonReleased === true,
@@ -358,16 +389,117 @@ export class MacNativeCursorRecordingSession implements CursorRecordingSession {
 		timestampMs: number,
 		cursorType: NativeCursorType | null,
 		assetId: string | null,
+		captureBounds: Rectangle | null,
 		leftButtonDown: boolean,
 		leftButtonPressed: boolean,
 		leftButtonReleased: boolean,
 	) {
 		const cursor = screen.getCursorScreenPoint();
-		const bounds = this.options.getDisplayBounds() ?? screen.getDisplayNearestPoint(cursor).bounds;
+		const interactionType = this.detectInteractionType(
+			leftButtonDown,
+			leftButtonPressed,
+			leftButtonReleased,
+		);
+
+		const bounds = this.resolveBounds(captureBounds, cursor);
+		if (!bounds) {
+			this.consecutiveOutsideSamples++;
+			if (interactionType !== "move") {
+				this.bufferInteraction(timestampMs, cursor, cursorType, assetId, interactionType);
+			}
+			return;
+		}
+
+		this.lastKnownCaptureBounds = bounds;
+		this.flushPendingInteractions();
+		this.pushSample(timestampMs, cursor.x, cursor.y, cursorType, assetId, bounds, interactionType);
+	}
+
+	private detectInteractionType(
+		leftButtonDown: boolean,
+		leftButtonPressed: boolean,
+		leftButtonReleased: boolean,
+	): NonNullable<CursorRecordingSample["interactionType"]> {
+		const interactionType =
+			leftButtonPressed || (leftButtonDown && !this.previousLeftButtonDown)
+				? "click"
+				: leftButtonReleased || (!leftButtonDown && this.previousLeftButtonDown)
+					? "mouseup"
+					: "move";
+		this.previousLeftButtonDown = leftButtonDown;
+		return interactionType;
+	}
+
+	private resolveBounds(
+		captureBounds: Rectangle | null,
+		cursor: { x: number; y: number },
+	): Rectangle | null {
+		if (captureBounds) {
+			return captureBounds;
+		}
+		if (this.options.requireCaptureBounds) {
+			return null;
+		}
+		return this.options.getDisplayBounds() ?? screen.getDisplayNearestPoint(cursor).bounds;
+	}
+
+	private bufferInteraction(
+		timestampMs: number,
+		cursor: { x: number; y: number },
+		cursorType: NativeCursorType | null,
+		assetId: string | null,
+		interactionType: "click" | "mouseup",
+	) {
+		// Without current bounds we can't normalize; fall back to the last bounds
+		// the helper reported so a click that fires during a brief gap (e.g.
+		// Mission Control transition) lands close to the right spot. Drop it if
+		// we've never seen bounds at all.
+		const bounds = this.lastKnownCaptureBounds;
+		if (!bounds) {
+			return;
+		}
+		this.pendingInteractionEvents.push({
+			timestampMs,
+			cursorX: cursor.x,
+			cursorY: cursor.y,
+			cursorType,
+			assetId,
+			interactionType,
+			bounds,
+		});
+	}
+
+	private flushPendingInteractions() {
+		if (this.pendingInteractionEvents.length === 0) {
+			return;
+		}
+		for (const pending of this.pendingInteractionEvents) {
+			this.pushSample(
+				pending.timestampMs,
+				pending.cursorX,
+				pending.cursorY,
+				pending.cursorType,
+				pending.assetId,
+				pending.bounds,
+				pending.interactionType,
+			);
+		}
+		this.pendingInteractionEvents = [];
+	}
+
+	private pushSample(
+		timestampMs: number,
+		cursorX: number,
+		cursorY: number,
+		cursorType: NativeCursorType | null,
+		assetId: string | null,
+		bounds: Rectangle,
+		interactionType: NonNullable<CursorRecordingSample["interactionType"]>,
+	) {
 		const width = Math.max(1, bounds.width);
 		const height = Math.max(1, bounds.height);
-		const normalizedX = (cursor.x - bounds.x) / width;
-		const normalizedY = (cursor.y - bounds.y) / height;
+		const normalizedX = (cursorX - bounds.x) / width;
+		const normalizedY = (cursorY - bounds.y) / height;
 		const isOutsideDisplay =
 			normalizedX < 0 || normalizedX > 1 || normalizedY < 0 || normalizedY > 1;
 		// Brief exits (under THRESHOLD samples) clip to the canvas edge via clip-path instead
@@ -380,13 +512,6 @@ export class MacNativeCursorRecordingSession implements CursorRecordingSession {
 		}
 		const visible =
 			this.consecutiveOutsideSamples < MacNativeCursorRecordingSession.OUTSIDE_HIDE_THRESHOLD;
-		const interactionType =
-			leftButtonPressed || (leftButtonDown && !this.previousLeftButtonDown)
-				? "click"
-				: leftButtonReleased || (!leftButtonDown && this.previousLeftButtonDown)
-					? "mouseup"
-					: "move";
-		this.previousLeftButtonDown = leftButtonDown;
 
 		this.samples.push({
 			timeMs: Math.max(0, timestampMs - this.startTimeMs),

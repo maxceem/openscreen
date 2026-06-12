@@ -16,7 +16,10 @@ import {
 	shell,
 	systemPreferences,
 } from "electron";
-import type { NativeMacRecordingRequest } from "../../src/lib/nativeMacRecording";
+import {
+	type NativeMacRecordingRequest,
+	parseMacWindowIdFromSourceId,
+} from "../../src/lib/nativeMacRecording";
 import type { NativeWindowsRecordingRequest } from "../../src/lib/nativeWindowsRecording";
 import {
 	type CursorCaptureMode,
@@ -788,12 +791,18 @@ async function startCursorRecording(recordingId?: number) {
 	}
 
 	pendingCursorRecordingData = null;
+	const sourceId = getSelectedSourceId();
+	const windowId = parseMacWindowIdFromSourceId(sourceId);
 	cursorRecordingSession = createCursorRecordingSession({
 		getDisplayBounds: getSelectedSourceBounds,
+		mac: {
+			requireCaptureBounds: windowId !== null,
+			windowId,
+		},
 		maxSamples: MAX_CURSOR_SAMPLES,
 		platform: process.platform,
 		sampleIntervalMs: CURSOR_SAMPLE_INTERVAL_MS,
-		sourceId: getSelectedSourceId(),
+		sourceId,
 		startTimeMs:
 			typeof recordingId === "number" && Number.isFinite(recordingId) ? recordingId : undefined,
 	});

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseMacDisplayIdFromSourceId, parseMacWindowIdFromSourceId } from "./nativeMacRecording";
+import {
+	normalizeNativeMacCaptureBounds,
+	parseMacDisplayIdFromSourceId,
+	parseMacWindowIdFromSourceId,
+} from "./nativeMacRecording";
 
 describe("nativeMacRecording source parsing", () => {
 	it("parses Electron window source ids into ScreenCaptureKit window ids", () => {
@@ -22,5 +26,18 @@ describe("nativeMacRecording source parsing", () => {
 		expect(parseMacDisplayIdFromSourceId("window:123:0")).toBeNull();
 		expect(parseMacDisplayIdFromSourceId("screen:not-a-number:0")).toBeNull();
 		expect(parseMacDisplayIdFromSourceId(undefined)).toBeNull();
+	});
+
+	it("normalizes helper-reported capture bounds", () => {
+		expect(normalizeNativeMacCaptureBounds({ x: 12, y: 34, width: 640, height: 360 })).toEqual({
+			x: 12,
+			y: 34,
+			width: 640,
+			height: 360,
+		});
+		expect(normalizeNativeMacCaptureBounds({ x: 0, y: 0, width: 0, height: 360 })).toBeNull();
+		expect(
+			normalizeNativeMacCaptureBounds({ x: 0, y: Number.NaN, width: 640, height: 360 }),
+		).toBeNull();
 	});
 });
